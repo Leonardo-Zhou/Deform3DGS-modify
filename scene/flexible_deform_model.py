@@ -112,6 +112,16 @@ class GaussianModel:
         return self._xyz
     @property
     def get_coef(self):
+        # 将_coefs重塑为[N, -1, basis_num]，其中-1是属性维度
+        N = len(self._xyz)
+        coefs = self._coefs.reshape(N, -1, self.args.curve_num).contiguous()
+        
+        # 分离位置、旋转和缩放的系数
+        pos_coefs = coefs[:, :3, :].reshape(N, -1).contiguous()  # [N, 3 * basis_num]
+        rot_coefs = coefs[:, 3:7, :].reshape(N, -1).contiguous()  # [N, 4 * basis_num]
+        scale_coefs = coefs[:, 7:10, :].reshape(N, -1).contiguous()  # [N, 3 * basis_num]
+        
+        return pos_coefs, rot_coefs, scale_coefs
         return self._coefs, self.args.poly_order_num, self.args.fs_order_num
     @property
     def get_features(self):
@@ -147,10 +157,15 @@ class GaussianModel:
 
         
         N = fused_point_cloud.shape[0]
-        weight_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num))
-        position_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num)) + torch.linspace(0,1,self.args.curve_num)
-        shape_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num)) + self.args.init_param
-        _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N,-1).float().to("cuda")
+        # 修改系数初始化以适应新的表示方法
+        # 为位置、旋转和缩放分别初始化系数
+        basis_num = self.args.curve_num
+        pos_coefs = torch.zeros((N, 3, basis_num))  # 位置系数
+        rot_coefs = torch.zeros((N, 4, basis_num))  # 旋转系数
+        scale_coefs = torch.zeros((N, 3, basis_num)) + self.args.init_param  # 缩放系数
+        
+        # 将所有系数连接在一起
+        _coefs = torch.cat([pos_coefs, rot_coefs, scale_coefs], dim=1).reshape(N, -1).float().to("cuda")
         self._coefs = nn.Parameter(_coefs.requires_grad_(True))
         
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
@@ -219,6 +234,7 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
+        # 为每个系数属性添加名称
         for i in range(self._coefs.shape[1]):
             l.append('coefs_{}'.format(i))
         return l
@@ -286,7 +302,7 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self._coefs = nn.Parameter(torch.tensor(coefs, dtype=torch.float, device="cuda").requires_grad_(True))
         self.active_sh_degree = self.max_sh_degree
-
+        
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
 
@@ -407,8 +423,42 @@ class GaussianModel:
         self._deformation_table = torch.cat([self._deformation_table,new_deformation_table],-1)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    def deformation(self, xyz: torch.Tensor, scales: torch.Tensor, rotations: torch.Tensor, time: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Apply flexible deformation modeling to the Gaussian model. Only the positions, scales, and rotations are
+        considered deformable in this work.
+
+        Args:
+            xyz (torch.Tensor): The current positions of the model vertices. (shape: [N, 3])
+            scales (torch.Tensor): The current scales per Gaussian primitive. (shape: [N, 3])
+            rotations (torch.Tensor): The current rotations of the model. (shape: [N, 4])
+            time (float): The current time.
+
+        Returns:
+            tuple: A tuple containing the updated positions, scaling factors, and rotations of the model.
+                   (xyz: torch.Tensor, scales: torch.Tensor, rotations: torch.Tensor)
+        """
+        # 使用新的变形表示方法
+        deform = self.gaussian_deformation(time, ch_num=self.args.ch_num, basis_num=self.args.curve_num)
+
+        # 分离位置、旋转和缩放的变形
+        deform_xyz = deform[:, :3]
+        deform_rot = deform[:, 3:7]
+        try:
+            # 当ch_num为10时
+            deform_scaling = deform[:, 7:10]
+            xyz = xyz + deform_xyz
+            rotations = rotations + deform_rot
+            scales = scales + deform_scaling
+        except:
+            # 当ch_num不为10时，只变形位置和旋转
+            xyz = xyz + deform_xyz
+            rotations = rotations + deform_rot
+        
+        return xyz, scales, rotations
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -508,15 +558,67 @@ class GaussianModel:
             torch.Tensor: The deformed model tensor.
         """
         N = len(self._xyz)
-        coefs = self._coefs.reshape(N, ch_num, 3 , basis_num).contiguous() 
-        weight, mu, sigma = torch.chunk(coefs,3,-2)                       
-        exponent = (t - mu)**2/(sigma**2+1e-4)
-        gaussian =  torch.exp(-exponent**2)         
-        return (gaussian*weight).sum(-1).squeeze()
+        # 将系数重新组织为位置、旋转和缩放的基函数表示
+        # 每个属性都用一组基函数表示，而不是共享基函数
+        pos_coefs = self._coefs[:, :3*basis_num].reshape(N, 3, basis_num).contiguous()
+        rot_coefs = self._coefs[:, 3*basis_num:7*basis_num].reshape(N, 4, basis_num).contiguous()
+        scale_coefs = self._coefs[:, 7*basis_num:10*basis_num].reshape(N, 3, basis_num).contiguous()
+        
+        # 为每个属性生成独立的基函数
+        pos_basis = self.generate_basis_functions(t, pos_coefs)
+        rot_basis = self.generate_basis_functions(t, rot_coefs)
+        scale_basis = self.generate_basis_functions(t, scale_coefs)
+        
+        # 计算每个属性的变形
+        pos_deform = (pos_basis * pos_coefs).sum(-1)
+        rot_deform = (rot_basis * rot_coefs).sum(-1)
+        scale_deform = (scale_basis * scale_coefs).sum(-1)
+        
+        # 合并所有变形
+        deform = torch.cat([pos_deform, rot_deform, scale_deform], dim=1)
+        return deform
     
+    def generate_basis_functions(self, t, coefs):
+        """
+        为给定的时间t生成基函数
+        
+        Args:
+            t (torch.Tensor): 时间参数
+            coefs (torch.Tensor): 系数张量 [N, attr_dim, basis_num]
+            
+        Returns:
+            torch.Tensor: 基函数值 [N, attr_dim, basis_num]
+        """
+        N, attr_dim, basis_num = coefs.shape
+        # 生成高斯基函数的参数
+        # 这里我们使用固定的中心和方差，但它们也可以是可学习的
+        centers = torch.linspace(0, 1, basis_num).to(t.device)  # [basis_num]
+        sigmas = torch.ones(basis_num).to(t.device) * 0.1  # [basis_num]
+        
+        # 计算高斯基函数
+        # t: [1] or [N]
+        # centers: [basis_num]
+        # 输出: [N, attr_dim, basis_num]
+        if t.dim() == 0:  # 标量时间
+            t = t.unsqueeze(0)  # [1]
+        
+        # 扩展维度以进行广播
+        t_expanded = t.view(-1, 1, 1)  # [N, 1, 1] 或 [1, 1, 1]
+        centers_expanded = centers.view(1, 1, -1)  # [1, 1, basis_num]
+        sigmas_expanded = sigmas.view(1, 1, -1)  # [1, 1, basis_num]
+        
+        # 计算高斯基函数
+        exponent = (t_expanded - centers_expanded)**2 / (2 * sigmas_expanded**2)
+        basis_functions = torch.exp(-exponent)  # [N, 1, basis_num]
+        
+        # 扩展到属性维度
+        basis_functions = basis_functions.expand(N, attr_dim, basis_num)
+        
+        return basis_functions
+
     def deformation(self, xyz: torch.Tensor, scales: torch.Tensor, rotations: torch.Tensor, time: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Apply flexible deformation modeling to the Gaussian model. Only the pistions, scales, and rotations are
+        Apply flexible deformation modeling to the Gaussian model. Only the positions, scales, and rotations are
         considered deformable in this work.
 
         Args:
@@ -529,20 +631,25 @@ class GaussianModel:
             tuple: A tuple containing the updated positions, scaling factors, and rotations of the model.
                    (xyz: torch.Tensor, scales: torch.Tensor, rotations: torch.Tensor)
         """
+        # 使用新的变形表示方法
         deform = self.gaussian_deformation(time, ch_num=self.args.ch_num, basis_num=self.args.curve_num)
 
+        # 分离位置、旋转和缩放的变形
         deform_xyz = deform[:, :3]
-        xyz += deform_xyz
         deform_rot = deform[:, 3:7]
-        rotations += deform_rot
         try:
-            # when ch_num is 10
+            # 当ch_num为10时
             deform_scaling = deform[:, 7:10]
-            scales += deform_scaling
-            return xyz, scales, rotations
+            xyz = xyz + deform_xyz
+            rotations = rotations + deform_rot
+            scales = scales + deform_scaling
         except:
-            return xyz, scales, rotations
+            # 当ch_num不为10时，只变形位置和旋转
+            xyz = xyz + deform_xyz
+            rotations = rotations + deform_rot
         
+        return xyz, scales, rotations
+
     def print_deformation_weight_grad(self):
         for name, weight in self._deformation.named_parameters():
             if weight.requires_grad:
